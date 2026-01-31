@@ -4,6 +4,11 @@
 const char* ssid = "Leos IoT 2,4GHz";
 const char* password = "leonardwecke";
 
+// Static IP configuration
+IPAddress staticIP(192, 168, 1, 50);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
 // GPIO pins - inverted logic (LOW = transistor ON)
 const int pinVolumeDown = 4;  // GPIO4 - D2
 const int pinVolumeUp   = 5;  // GPIO5 - D1
@@ -123,7 +128,8 @@ void setup() {
     digitalWrite(pinVolumeUp, HIGH);
     digitalWrite(pinLed, HIGH);
 
-    // Connect WiFi
+    // Connect WiFi with static IP
+    WiFi.config(staticIP, gateway, subnet);
     WiFi.begin(ssid, password);
     Serial.print("Connecting to WiFi");
     while (WiFi.status() != WL_CONNECTED) {
