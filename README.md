@@ -1,146 +1,113 @@
 # esp-bt-dongle-volume-control
 
-ESP8266 (NodeMCU v2) controls the volume of a Bluetooth audio dongle by simulating button presses over GPIO — no transistors needed. Exposed via TCP, integrated into Home Assistant, and callable from Alexa.
+ESP8266 controls the volume of a BT audio dongle by simulating button presses via GPIO. The interesting part: a Claude AI agent can trigger this directly through a chain of standard interfaces — MCP tool → HA API → shell → TCP → GPIO.
 
 ---
 
-## Architecture
+## The Backbone (replicate this)
+
+This is the full communication chain from AI agent to physical GPIO pin:
 
 ```
-Alexa Voice
+Claude AI Agent
     │
-    │  "Alexa, aktiviere Beamer Neun"
+    │  ha__tv_volume_set(level=9)          ← MCP Tool Call
     ▼
-Home Assistant Script (beamer_neun)
+ha-functions MCP Server
     │
-    │  shell_command: python3 tv_volume.py SET:9
+    │  POST /api/services/shell_command/tv_volume_set
+    │  {"level": 9}                         ← HA REST API
     ▼
-Python TCP Client (tv_volume.py)
+Home Assistant
     │
-    │  TCP :42069  →  "SET:9\n"
+    │  python3 /config/python_scripts/tv_volume.py SET:9
+    │                                        ← shell_command
     ▼
-ESP8266 (192.168.1.50)
+tv_volume.py (Python TCP client)
     │
-    │  SYNC: 16x DOWN → 0, then 10x UP → 9
+    │  TCP connect 192.168.1.50:42069
+    │  send "SET:9\n"                        ← raw TCP
     ▼
-GPIO Open-Drain (D1 / D2)
+ESP8266 (NodeMCU v2)
     │
-    │  OUTPUT+LOW = switch closed (GND)
-    │  INPUT      = switch open  (high-Z)
+    │  SYNC: 16x LOW on GPIO4, then 10x LOW on GPIO5
+    │                                        ← GPIO active-low output
     ▼
-BT Dongle Volume Buttons
+BT Dongle Volume Buttons (GND-triggered)
 ```
+
+Each layer is independent and replaceable. You only need to replicate the layers relevant to your use case.
 
 ---
 
-## Hardware
+## Layer 1 — GPIO (ESP8266)
 
-**NodeMCU v2 (ESP8266)** — no external transistors required.
+The ESP8266 GPIO pin drives to GND (`OUTPUT + LOW`) to close the button contact, and releases it (`INPUT` = high-Z) to open it. No transistor needed if both boards share GND.
 
-The GPIO pins act as open-drain switches: setting a pin `OUTPUT+LOW` pulls the button contact to GND (same as pressing the button). Setting it `INPUT` leaves it floating (button released). Both boards must share a common GND.
-
-| Pin | NodeMCU Label | Function |
-|-----|---------------|----------|
-| GPIO4 | D2 | Volume Down |
-| GPIO5 | D1 | Volume Up |
-| GPIO2 | D4 | Onboard LED (LOW during SYNC) |
+```cpp
+void pinOn(int pin)  { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
+void pinOff(int pin) { pinMode(pin, INPUT); }
+```
 
 **Wiring:**
-- `D2` → Volume Down button contact of BT dongle
-- `D1` → Volume Up button contact of BT dongle
-- `GND` → GND of BT dongle (shared ground — mandatory)
+```
+ESP GND  ──────────────────  BT Dongle GND   (shared ground, mandatory)
+ESP D2 (GPIO4)  ──────────  Volume DOWN button contact
+ESP D1 (GPIO5)  ──────────  Volume UP button contact
+```
 
----
+The GPIO pin actively pulls the button contact to GND — same effect as pressing the physical button.
 
-## Network
+**Board:** NodeMCU v2, PlatformIO
 
-| Key | Value |
-|-----|-------|
-| IP | `192.168.1.50` (static) |
-| Port | `42069` (TCP) |
-| WiFi | IoT 2.4GHz network |
-
----
-
-## TCP Protocol
-
-Connect, send command + newline, read response, disconnect.
-
-| Command | Description | Response |
-|---------|-------------|----------|
-| `GET` | Return current tracked volume | `OK volume=9` |
-| `UP` | Volume +1 | `OK volume=10` |
-| `DOWN` | Volume -1 | `OK volume=8` |
-| `SET:0`–`SET:15` | Sync to absolute level | `OK volume=5` |
-| `SYNC` | Reset to default (9) | `OK volume=9` |
-| `TEST` | Hold DOWN 2s, pause, hold UP 2s — for hardware testing | `OK test done` |
-
-Error responses: `ERR busy`, `ERR already at max (15)`, `ERR already at min (0)`, `ERR range 0-15`, `ERR unknown command`
-
----
-
-## SYNC Algorithm
-
-The BT dongle has no feedback — the ESP tracks volume in software. To recover from drift, `SET:X` always performs a full resync:
-
-1. Press DOWN **16 times** (MAX_VOLUME + 1) → guaranteed hardware minimum regardless of current position
-2. Wait 500ms
-3. Press UP **target + 1 times** → hardware ignores the first UP press after reaching minimum, so +1 compensates
-
-Same sequence runs on boot (syncs to `DEFAULT_VOLUME = 9`).
-
-**Timing:**
-- Button press held: 100ms
-- Pause between presses: 100ms
-
----
-
-## Build & Flash
-
-PlatformIO project, board `nodemcuv2`.
+```ini
+; platformio.ini
+[env:nodemcuv2]
+platform = espressif8266
+board = nodemcuv2
+framework = arduino
+lib_deps =
+    ESP8266WiFi
+    ESPAsyncTCP@^1.2.2
+```
 
 ```bash
-pio run -t upload          # build and flash via /dev/ttyUSB0
-pio device monitor         # serial monitor at 115200 baud
-```
-
-Serial output on boot:
-```
-Connecting to WiFi....
-IP: 192.168.1.50
-Boot SYNC...
-Boot SYNC done. volume=9
-TCP server ready on port 42069
+pio run -t upload
+pio device monitor   # 115200 baud
 ```
 
 ---
 
-## Testing via CLI
+## Layer 2 — TCP Server (ESP8266)
 
+The firmware runs a non-blocking async TCP server on port 42069. Commands are single-line ASCII strings.
+
+**Protocol:**
+
+| Command | Action | Response |
+|---------|--------|----------|
+| `GET` | Return tracked volume | `OK volume=9` |
+| `UP` | +1 step | `OK volume=10` |
+| `DOWN` | -1 step | `OK volume=8` |
+| `SET:0`–`SET:15` | Full resync to target | `OK volume=5` |
+| `SYNC` | Resync to default (9) | `OK volume=9` |
+| `TEST` | Hold DOWN 2s, pause, hold UP 2s | `OK test done` |
+
+**SYNC algorithm** — required because the dongle has no feedback:
+1. Press DOWN **16×** (MAX+1) → guaranteed hardware minimum
+2. Press UP **target+1×** → hardware ignores first UP after hitting min, +1 compensates
+
+**Quick test:**
 ```bash
-# Quick test
 echo "GET"   | nc 192.168.1.50 42069
-echo "SET:5" | nc 192.168.1.50 42069
 echo "SET:9" | nc 192.168.1.50 42069
-
-# Hardware test (holds buttons 2s each — listen/feel for dongle response)
-echo "TEST"  | nc 192.168.1.50 42069
-```
-
-Or use the Python client directly:
-
-```bash
-python3 tv_volume.py GET
-python3 tv_volume.py SET:9
-python3 tv_volume.py UP
-python3 tv_volume.py DOWN
 ```
 
 ---
 
-## Python Client (`tv_volume.py`)
+## Layer 3 — Python TCP Client
 
-Minimal TCP client used by Home Assistant shell commands:
+Minimal script that bridges shell → TCP. Deployed into the HA container at `/config/python_scripts/tv_volume.py`.
 
 ```python
 import socket, sys
@@ -153,60 +120,92 @@ with socket.socket() as s:
     print(s.recv(64).decode().strip())
 ```
 
+```bash
+python3 tv_volume.py SET:9
+python3 tv_volume.py GET
+```
+
 ---
 
-## Home Assistant Integration
+## Layer 4 — Home Assistant
 
 ### shell_command (`configuration.yaml`)
 
+Exposes the Python script as an HA service. The `{{ level }}` template is filled at call time.
+
 ```yaml
 shell_command:
-  tv_volume_set: "python3 /config/python_scripts/tv_volume.py SET:{{ level }}"
-  tv_volume_up:   python3 /config/python_scripts/tv_volume.py UP
-  tv_volume_down: python3 /config/python_scripts/tv_volume.py DOWN
-  tv_volume_sync: python3 /config/python_scripts/tv_volume.py SYNC
+  tv_volume_set:  "python3 /config/python_scripts/tv_volume.py SET:{{ level }}"
+  tv_volume_up:    python3 /config/python_scripts/tv_volume.py UP
+  tv_volume_down:  python3 /config/python_scripts/tv_volume.py DOWN
+  tv_volume_sync:  python3 /config/python_scripts/tv_volume.py SYNC
 ```
 
 ### Scripts (`scripts.yaml`)
 
-16 scripts — one per volume level — callable from automations, the AI agent, or Alexa:
+16 scripts (beamer_null → beamer_fuenfzehn) wrap the shell_command with a fixed level. Makes them callable by name from automations, Alexa, and the AI agent.
 
 ```yaml
-beamer_null:
-  alias: "Beamer Null"
-  sequence:
-    - action: shell_command.tv_volume_set
-      data: {level: 0}
-
 beamer_neun:
   alias: "Beamer Neun"
   sequence:
     - action: shell_command.tv_volume_set
       data: {level: 9}
-
-# ... beamer_eins through beamer_fuenfzehn
 ```
 
-### Alexa
-
-Scripts are exposed as scenes via the HA Alexa Smart Home integration (requires Nabu Casa or equivalent).
-
+Alexa discovers these as scenes (requires HA Smart Home integration):
 ```
-"Alexa, aktiviere Beamer Neun"   →  SET:9
-"Alexa, aktiviere Beamer Fuenf"  →  SET:5
+"Alexa, aktiviere Beamer Neun"
 ```
 
-Alternatively, via the HA Conversation Skill:
+---
 
-```
-"Alexa, smart house, beamer auf neun"
+## Layer 5 — MCP Tool (AI Agent Interface)
+
+The `ha__tv_volume_set` tool in the [ha-functions MCP server](https://github.com/NG-Bullseye/ha-functions-mcp) lets the Claude AI agent call the full chain with a single function call.
+
+**Tool definition (`functions.txt`):**
+```yaml
+- spec:
+    name: tv_volume_set
+    description: "Set TV/BT-Dongle volume to exact level 0-15."
+    parameters:
+      type: object
+      properties:
+        level:
+          type: integer
+          description: "Volume 0-15"
+      required: [level]
+  function:
+    type: script
+    sequence:
+      - service: shell_command.tv_volume_set
+        data:
+          level: "{{ level }}"
 ```
 
-### AI Agent (ha-functions MCP)
-
-The `ha__tv_volume_set` tool is available to the Claude-based conversation agent:
-
+**MCP server** translates the tool call into an HA REST API call:
 ```
-User: "Mach den Beamer leiser, auf 6"
-Agent: ha__tv_volume_set(level=6)  →  shell_command → tcp → ESP8266
+POST http://HA_HOST:8123/api/services/shell_command/tv_volume_set
+Authorization: Bearer <token>
+{"level": 9}
 ```
+
+Claude then calls it like any other function — no extra plumbing needed:
+```
+User: "Mach den Beamer auf 9"
+Agent: ha__tv_volume_set(level=9)
+→ HA API → shell → python → TCP → ESP8266 → GPIO
+```
+
+---
+
+## Replicate Quickly
+
+| What you want | Start here |
+|---------------|------------|
+| Control any GPIO-triggered device | Layer 1–2 only: ESP8266 + TCP server |
+| Add a new HA-callable device command | Layer 3–4: Python client + shell_command |
+| Let the AI agent control it | Layer 5: Add entry in functions.txt |
+| Voice control via Alexa | Layer 4: HA scripts + Smart Home integration |
+| Test without AI | `echo "SET:9" \| nc 192.168.1.50 42069` |
