@@ -9,126 +9,229 @@ IPAddress staticIP(192, 168, 1, 50);
 IPAddress gateway(192, 168, 1, 1);
 IPAddress subnet(255, 255, 255, 0);
 
-// GPIO pins - inverted logic (LOW = transistor ON)
-const int pinVolumeDown = 4;  // GPIO4 - D2
-const int pinVolumeUp   = 5;  // GPIO5 - D1
-const int pinLed        = 2;  // GPIO2 - onboard LED
+// GPIO pins
+// DOWN: GPIO4 (D2) - open-drain: OUTPUT+LOW = ON, INPUT = OFF
+// UP:   GPIO5 (D1) - open-drain: OUTPUT+LOW = ON, INPUT = OFF
+const int pinVolumeDown = 4;
+const int pinVolumeUp   = 5;
+const int pinLed        = 2;
 
-const int PRESS_DURATION_MS = 50;   // how long the button is "held"
-const int PRESS_PAUSE_MS    = 100;  // pause between presses
+const int PRESS_DURATION_MS = 100;
+const int PRESS_PAUSE_MS    = 100;
 const int MAX_VOLUME        = 15;
 const int DEFAULT_VOLUME    = 9;
+const int TEST_HOLD_MS      = 2000;
 
 int currentVolume = 0;
 
-AsyncServer tcpServer(42069);
+// Open-drain: LOW = switch closed, INPUT = switch open (high-Z)
+void pinOn(int pin)  { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
+void pinOff(int pin) { pinMode(pin, INPUT); }
 
-// --- Button press simulation ---
+// --- Non-blocking state machine ---
 
-void pressButton(int pin) {
-    digitalWrite(pin, LOW);   // ON (inverted)
-    delay(PRESS_DURATION_MS);
-    digitalWrite(pin, HIGH);  // OFF
-    delay(PRESS_PAUSE_MS);
-}
+enum PressState { IDLE, PIN_ON, PIN_OFF, TEST_DOWN_ON, TEST_DOWN_OFF, TEST_UP_ON, TEST_UP_OFF };
 
-void volumeDownOnce() {
-    pressButton(pinVolumeDown);
-    if (currentVolume > 0) currentVolume--;
-    Serial.printf("DOWN -> volume=%d\n", currentVolume);
-}
+struct PressJob {
+    int pin;
+    int remaining;       // how many presses left
+    int targetVolume;    // volume after all presses
+    bool isUp;           // true=up, false=down
+    AsyncClient* client; // respond to this client when done (may be null)
+};
 
-void volumeUpOnce() {
-    pressButton(pinVolumeUp);
-    if (currentVolume < MAX_VOLUME) currentVolume++;
-    Serial.printf("UP -> volume=%d\n", currentVolume);
-}
+PressState pressState = IDLE;
+PressJob   activeJob  = {0, 0, 0, false, nullptr};
+unsigned long pressTimer = 0;
 
-// SYNC: 15x down to guarantee level 0, then go to target
-void syncToVolume(int target) {
-    if (target < 0) target = 0;
-    if (target > MAX_VOLUME) target = MAX_VOLUME;
-
-    Serial.printf("SYNC: resetting to 0 (15x DOWN)...\n");
-    digitalWrite(pinLed, LOW);  // LED on during sync
-
-    for (int i = 0; i < MAX_VOLUME; i++) {
-        pressButton(pinVolumeDown);
+void startJob(int pin, int count, int target, bool up, AsyncClient* client) {
+    if (count <= 0) {
+        // Nothing to do — send response immediately if client alive
+        if (client && client->connected() && client->canSend()) {
+            String r = "OK volume=" + String(target) + "\n";
+            client->write(r.c_str(), r.length());
+        }
+        currentVolume = target;
+        return;
     }
-    currentVolume = 0;
+    activeJob = {pin, count, target, up, client};
+    pressState = PIN_ON;
+    pinOn(pin);
+    pressTimer = millis();
+}
 
-    Serial.printf("SYNC: going to %d (%dx UP)...\n", target, target);
-    for (int i = 0; i < target; i++) {
-        pressButton(pinVolumeUp);
+void tickStateMachine() {
+    if (pressState == IDLE) return;
+
+    unsigned long now = millis();
+
+    if (pressState == PIN_ON) {
+        if (now - pressTimer >= PRESS_DURATION_MS) {
+            pinOff(activeJob.pin);
+            pressState = PIN_OFF;
+            pressTimer = now;
+        }
+    } else if (pressState == PIN_OFF) {
+        if (now - pressTimer >= PRESS_PAUSE_MS) {
+            activeJob.remaining--;
+
+            if (activeJob.remaining > 0) {
+                pinOn(activeJob.pin);
+                pressState = PIN_ON;
+                pressTimer = now;
+            } else {
+                currentVolume = activeJob.targetVolume;
+                digitalWrite(pinLed, HIGH);
+                Serial.printf("Job done. volume=%d\n", currentVolume);
+
+                if (activeJob.client && activeJob.client->connected() && activeJob.client->canSend()) {
+                    String r = "OK volume=" + String(currentVolume) + "\n";
+                    activeJob.client->write(r.c_str(), r.length());
+                }
+                activeJob.client = nullptr;
+                pressState = IDLE;
+            }
+        }
     }
-    currentVolume = target;
+    // TEST mode: 2s DOWN, pause, 2s UP
+    else if (pressState == TEST_DOWN_ON) {
+        if (now - pressTimer >= TEST_HOLD_MS) {
+            pinOff(pinVolumeDown);
+            pressState = TEST_DOWN_OFF;
+            pressTimer = now;
+            Serial.println("TEST: DOWN released, pausing...");
+        }
+    }
+    else if (pressState == TEST_DOWN_OFF) {
+        if (now - pressTimer >= 500) {
+            pinOn(pinVolumeUp);
+            pressState = TEST_UP_ON;
+            pressTimer = now;
+            Serial.println("TEST: UP active...");
+        }
+    }
+    else if (pressState == TEST_UP_ON) {
+        if (now - pressTimer >= TEST_HOLD_MS) {
+            pinOff(pinVolumeUp);
+            pressState = TEST_UP_OFF;
+            pressTimer = now;
+            Serial.println("TEST: UP released");
+        }
+    }
+    else if (pressState == TEST_UP_OFF) {
+        if (now - pressTimer >= 200) {
+            if (activeJob.client && activeJob.client->connected() && activeJob.client->canSend()) {
+                activeJob.client->write("OK test done\n", 13);
+            }
+            activeJob.client = nullptr;
+            pressState = IDLE;
+            Serial.println("TEST done.");
+        }
+    }
+}
 
-    digitalWrite(pinLed, HIGH);  // LED off
-    Serial.printf("SYNC done. volume=%d\n", currentVolume);
+// --- SYNC sequence: DOWN phase then UP phase ---
+
+enum SyncPhase { SYNC_NONE, SYNC_DOWN, SYNC_UP };
+SyncPhase syncPhase = SYNC_NONE;
+int syncTarget = 0;
+AsyncClient* syncClient = nullptr;
+
+void startSync(int target, AsyncClient* client) {
+    if (pressState != IDLE || syncPhase != SYNC_NONE) return; // busy
+    syncTarget = target;
+    syncClient = client;
+    syncPhase = SYNC_DOWN;
+    digitalWrite(pinLed, LOW);
+    Serial.printf("SYNC start -> target=%d\n", target);
+    startJob(pinVolumeDown, MAX_VOLUME + 1, 0, false, nullptr);
+}
+
+void tickSync() {
+    if (syncPhase == SYNC_NONE) return;
+    if (pressState != IDLE) return; // still pressing
+
+    if (syncPhase == SYNC_DOWN) {
+        // DOWN phase complete, now go UP
+        syncPhase = SYNC_UP;
+        // +1 extra UP press: first press after full-down is consistently ignored by hardware
+        int upPresses = syncTarget > 0 ? syncTarget + 1 : 0;
+        startJob(pinVolumeUp, upPresses, syncTarget, true, syncClient);
+        syncClient = nullptr;
+        syncPhase = SYNC_NONE;
+    }
+}
+
+bool isBusy() {
+    return pressState != IDLE || syncPhase != SYNC_NONE;
 }
 
 // --- TCP command handling ---
 
 void handleCommand(const String& cmd, AsyncClient* client) {
-    String response;
+    if (isBusy()) {
+        if (client->connected() && client->canSend())
+            client->write("ERR busy\n", 9);
+        return;
+    }
 
     if (cmd == "UP") {
-        if (currentVolume < MAX_VOLUME) {
-            volumeUpOnce();
-            response = "OK volume=" + String(currentVolume) + "\n";
-        } else {
-            response = "ERR already at max (15)\n";
+        if (currentVolume >= MAX_VOLUME) {
+            if (client->connected() && client->canSend())
+                client->write("ERR already at max (15)\n", 23);
+            return;
         }
+        startJob(pinVolumeUp, 1, currentVolume + 1, true, client);
     }
     else if (cmd == "DOWN") {
-        if (currentVolume > 0) {
-            volumeDownOnce();
-            response = "OK volume=" + String(currentVolume) + "\n";
-        } else {
-            response = "ERR already at min (0)\n";
+        if (currentVolume <= 0) {
+            if (client->connected() && client->canSend())
+                client->write("ERR already at min (0)\n", 22);
+            return;
         }
+        startJob(pinVolumeDown, 1, currentVolume - 1, false, client);
     }
     else if (cmd.startsWith("SET:")) {
         int target = cmd.substring(4).toInt();
         if (target < 0 || target > MAX_VOLUME) {
-            response = "ERR range 0-15\n";
-        } else {
-            syncToVolume(target);
-            response = "OK volume=" + String(currentVolume) + "\n";
+            if (client->connected() && client->canSend())
+                client->write("ERR range 0-15\n", 15);
+            return;
         }
+        startSync(target, client);
     }
     else if (cmd == "SYNC") {
-        syncToVolume(DEFAULT_VOLUME);
-        response = "OK synced to " + String(DEFAULT_VOLUME) + "\n";
+        startSync(DEFAULT_VOLUME, client);
     }
     else if (cmd == "GET") {
-        response = "OK volume=" + String(currentVolume) + "\n";
+        String r = "OK volume=" + String(currentVolume) + "\n";
+        if (client->connected() && client->canSend())
+            client->write(r.c_str(), r.length());
+    }
+    else if (cmd == "TEST") {
+        // 2s DOWN pin active, 500ms pause, 2s UP pin active
+        Serial.println("TEST: DOWN active...");
+        activeJob.client = client;
+        pinOn(pinVolumeDown);
+        pressState = TEST_DOWN_ON;
+        pressTimer = millis();
     }
     else {
-        response = "ERR unknown command. USE: UP, DOWN, SET:0-15, SYNC, GET\n";
+        if (client->connected() && client->canSend())
+            client->write("ERR unknown command\n", 20);
     }
-
-    if (client->canSend()) {
-        client->write(response.c_str(), response.length());
-    }
-    Serial.print("-> " + response);
 }
 
-// --- Setup & Loop ---
+AsyncServer tcpServer(42069);
 
 void setup() {
     Serial.begin(115200);
 
-    pinMode(pinVolumeDown, OUTPUT);
-    pinMode(pinVolumeUp, OUTPUT);
+    pinMode(pinVolumeDown, INPUT);  // off = high-Z
+    pinMode(pinVolumeUp, INPUT);    // off = high-Z
     pinMode(pinLed, OUTPUT);
-
-    // All OFF at startup
-    digitalWrite(pinVolumeDown, HIGH);
-    digitalWrite(pinVolumeUp, HIGH);
     digitalWrite(pinLed, HIGH);
 
-    // Connect WiFi with static IP
     WiFi.config(staticIP, gateway, subnet);
     WiFi.begin(ssid, password);
     Serial.print("Connecting to WiFi");
@@ -137,14 +240,26 @@ void setup() {
         Serial.print(".");
     }
     Serial.println();
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("IP: " + WiFi.localIP().toString());
 
-    // SYNC on boot -> default volume
+    // Boot SYNC (blocking here is fine — no clients connected yet)
     Serial.println("Boot SYNC...");
-    syncToVolume(DEFAULT_VOLUME);
+    for (int i = 0; i < MAX_VOLUME + 1; i++) {
+        pinOn(pinVolumeDown);
+        delay(PRESS_DURATION_MS);
+        pinOff(pinVolumeDown);
+        delay(PRESS_PAUSE_MS);
+    }
+    delay(500);
+    for (int i = 0; i < DEFAULT_VOLUME + 1; i++) {
+        pinOn(pinVolumeUp);
+        delay(PRESS_DURATION_MS);
+        pinOff(pinVolumeUp);
+        delay(PRESS_PAUSE_MS);
+    }
+    currentVolume = DEFAULT_VOLUME;
+    Serial.printf("Boot SYNC done. volume=%d\n", currentVolume);
 
-    // TCP server
     tcpServer.onClient([](void* arg, AsyncClient* client) {
         Serial.println("Client connected");
 
@@ -157,16 +272,19 @@ void setup() {
 
         client->onDisconnect([](void* arg, AsyncClient* c) {
             Serial.println("Client disconnected");
+            // Clear client ref if it's our active one
+            if (activeJob.client == c) activeJob.client = nullptr;
+            if (syncClient == c) syncClient = nullptr;
             delete c;
         }, nullptr);
 
     }, nullptr);
 
     tcpServer.begin();
-    Serial.println("TCP server on port 42069 ready");
-    Serial.printf("Volume: %d/%d\n", currentVolume, MAX_VOLUME);
+    Serial.println("TCP server ready on port 42069");
 }
 
 void loop() {
-    // nothing needed - async TCP handles everything
+    tickStateMachine();
+    tickSync();
 }
